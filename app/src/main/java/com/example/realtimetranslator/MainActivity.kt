@@ -2,6 +2,7 @@ package com.example.realtimetranslator
 
 import android.Manifest
 import android.content.pm.PackageManager
+import android.graphics.RectF
 import android.os.Bundle
 import android.util.Log
 import android.util.Size
@@ -17,19 +18,29 @@ import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.Preview as CameraXPreview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Size as ComposeSize
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.compose.ui.unit.toSize
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.core.content.ContextCompat
 import com.example.realtimetranslator.ui.theme.RealTimeTranslatorTheme
@@ -40,6 +51,8 @@ import com.google.mlkit.nl.translate.TranslatorOptions
 import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
+import kotlin.math.pow
+import kotlin.math.sqrt
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -93,6 +106,8 @@ fun CameraPermissionWrapper(modifier: Modifier = Modifier) {
     }
 }
 
+data class TextBlockData(val box: RectF, val text: String, val sourceImageWidth: Int, val sourceImageHeight: Int)
+
 @OptIn(ExperimentalGetImage::class)
 @Composable
 fun CameraPreviewView(
@@ -102,7 +117,6 @@ fun CameraPreviewView(
     val lifecycleOwner = LocalLifecycleOwner.current
     val recognizer = remember { TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS) }
 
-    // Translator setup
     val options = remember {
         TranslatorOptions.Builder()
             .setSourceLanguage(TranslateLanguage.GERMAN)
@@ -112,12 +126,14 @@ fun CameraPreviewView(
     val germanToEnglishTranslator = remember { Translation.getClient(options) }
     var modelReady by remember { mutableStateOf(false) }
 
-    var originalText by remember { mutableStateOf("Point at German text") }
-    var translatedText by remember { mutableStateOf("") }
-
+    var highlightedBlock by remember { mutableStateOf<TextBlockData?>(null) }
+    var translatedText by remember { mutableStateOf("Point at text to translate") }
+    var viewSize by remember { mutableStateOf(ComposeSize.Zero) }
+    
+    var isFrozen by remember { mutableStateOf(false) }
+    var frozenTranslatedText by remember { mutableStateOf("") }
     var lastAnalyzedTimestamp by remember { mutableStateOf(0L) }
 
-    // Download model and manage lifecycle
     DisposableEffect(Unit) {
         val conditions = DownloadConditions.Builder().build()
         germanToEnglishTranslator.downloadModelIfNeeded(conditions)
@@ -126,119 +142,182 @@ fun CameraPreviewView(
         onDispose { germanToEnglishTranslator.close() }
     }
 
-    Box(modifier = modifier) {
-        val previewView = remember { PreviewView(context) }
-        AndroidView(
-            factory = { previewView },
-            modifier = Modifier.fillMaxSize()
-        )
-
-        Column(
-            modifier = Modifier
-                .fillMaxSize()
-                .padding(16.dp),
-            verticalArrangement = Arrangement.Bottom,
-            horizontalAlignment = Alignment.CenterHorizontally
-        ) {
-            Text(
-                text = originalText,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .background(Color.Black.copy(alpha = 0.6f))
-                    .padding(horizontal = 16.dp, vertical = 8.dp),
-                color = Color.White,
-                fontSize = 16.sp,
-                textAlign = TextAlign.Center
-            )
-            Spacer(modifier = Modifier.height(8.dp))
-            Text(
-                text = translatedText,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .background(Color.Black.copy(alpha = 0.6f))
-                    .padding(horizontal = 16.dp, vertical = 8.dp),
-                color = Color.Green,
-                fontSize = 20.sp,
-                textAlign = TextAlign.Center
-            )
+    Box(modifier = modifier
+        .onGloballyPositioned { viewSize = it.size.toSize() }
+        .clickable(interactionSource = remember { MutableInteractionSource() }, indication = null) {
+            if (highlightedBlock != null || isFrozen) {
+                isFrozen = !isFrozen
+                if (isFrozen) {
+                    frozenTranslatedText = translatedText
+                }
+            }
+        }
+    ) {
+        val previewView = remember {
+            PreviewView(context).apply { this.scaleType = PreviewView.ScaleType.FIT_CENTER }
+        }
+        AndroidView(factory = { previewView }, modifier = Modifier.fillMaxSize())
+        
+        // Visible crosshair
+        if (!isFrozen) {
+             Text("+", modifier = Modifier.align(Alignment.Center), color = Color.White, fontSize = 32.sp)
         }
 
-        LaunchedEffect(Unit) {
-            val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
-            cameraProviderFuture.addListener({
-                val cameraProvider = cameraProviderFuture.get()
-                val preview = CameraXPreview.Builder()
-                    .setTargetResolution(Size(640, 480))
-                    .build().also {
-                        it.setSurfaceProvider(previewView.surfaceProvider)
-                    }
+        // Bounding Box Canvas
+        Canvas(modifier = Modifier.fillMaxSize()) {
+            if (!isFrozen) {
+                highlightedBlock?.let { data ->
+                    val imageWidth = data.sourceImageWidth
+                    val imageHeight = data.sourceImageHeight
 
-                val cameraSelector = when {
-                    cameraProvider.hasCamera(CameraSelector.DEFAULT_BACK_CAMERA) -> CameraSelector.DEFAULT_BACK_CAMERA
-                    cameraProvider.hasCamera(CameraSelector.DEFAULT_FRONT_CAMERA) -> CameraSelector.DEFAULT_FRONT_CAMERA
-                    else -> throw IllegalStateException("No suitable camera found")
-                }
+                    val viewAspectRatio = viewSize.width / viewSize.height
+                    val imageAspectRatio = imageWidth.toFloat() / imageHeight.toFloat()
 
-                val imageAnalyzer = ImageAnalysis.Builder()
-                    .setTargetResolution(Size(640, 480))
-                    .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
-                    .build()
+                    val scale: Float
+                    var offsetX = 0f
+                    var offsetY = 0f
 
-                imageAnalyzer.setAnalyzer(ContextCompat.getMainExecutor(context)) { imageProxy ->
-                    val currentTime = System.currentTimeMillis()
-                    if (currentTime - lastAnalyzedTimestamp < 1500) { // Increased delay to 1.5 seconds
-                        imageProxy.close()
-                        return@setAnalyzer
-                    }
-
-                    val mediaImage = imageProxy.image
-                    if (mediaImage != null) {
-                        val image = InputImage.fromMediaImage(mediaImage, imageProxy.imageInfo.rotationDegrees)
-                        recognizer.process(image)
-                            .addOnSuccessListener { visionText ->
-                                // Find the largest text block
-                                val largestBlock = visionText.textBlocks.maxByOrNull {
-                                    it.boundingBox?.width()?.times(it.boundingBox?.height() ?: 0) ?: 0
-                                }
-
-                                if (largestBlock != null) {
-                                    val newText = largestBlock.text
-                                    if (newText.isNotBlank() && newText != originalText) {
-                                        originalText = newText
-                                        if (modelReady) {
-                                            germanToEnglishTranslator.translate(newText)
-                                                .addOnSuccessListener { translated ->
-                                                    translatedText = translated
-                                                }
-                                                .addOnFailureListener { e ->
-                                                    translatedText = "Translation failed."
-                                                    Log.e("Translation", "Translation failed", e)
-                                                }
-                                        } else {
-                                            translatedText = "Translator not ready."
-                                        }
-                                    }
-                                } else {
-                                    // If no text is found, reset the labels
-                                    originalText = "Point at German text"
-                                    translatedText = ""
-                                }
-                            }
-                            .addOnFailureListener { e -> Log.e("TextRecognition", "Recognition failed", e) }
-                            .addOnCompleteListener { imageProxy.close() }
-                        lastAnalyzedTimestamp = currentTime
+                    if (viewAspectRatio > imageAspectRatio) {
+                        scale = viewSize.height / imageHeight
+                        offsetX = (viewSize.width - imageWidth * scale) / 2
                     } else {
-                        imageProxy.close()
+                        scale = viewSize.width / imageWidth
+                        offsetY = (viewSize.height - imageHeight * scale) / 2
                     }
+
+                    val transformedRect = RectF().apply {
+                        left = data.box.left * scale + offsetX
+                        right = data.box.right * scale + offsetX
+                        top = data.box.top * scale + offsetY
+                        bottom = data.box.bottom * scale + offsetY
+                    }
+
+                    drawRect(
+                        color = Color.Blue.copy(alpha = 0.4f),
+                        topLeft = Offset(transformedRect.left, transformedRect.top),
+                        size = ComposeSize(transformedRect.width(), transformedRect.height()),
+                        style = Stroke(width = 4f)
+                    )
+                }
+            }
+        }
+
+        if (isFrozen) {
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(Color.Black.copy(alpha = 0.8f))
+                    .padding(32.dp) // Increased padding
+                    .verticalScroll(rememberScrollState()), // Make the column scrollable
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Text(
+                    text = frozenTranslatedText,
+                    color = Color.White, 
+                    fontSize = 22.sp, // More readable font size
+                    textAlign = TextAlign.Center
+                )
+                Spacer(modifier = Modifier.height(32.dp))
+                Text(
+                    text = "Tap anywhere to resume", 
+                    color = Color.White.copy(alpha = 0.7f), 
+                    fontSize = 18.sp
+                )
+            }
+        } else {
+            // Live Translation Panel
+            Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .padding(16.dp),
+                verticalArrangement = Arrangement.Bottom,
+                horizontalAlignment = Alignment.CenterHorizontally
+            ) {
+                Text(
+                    text = translatedText,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(Color.Black.copy(alpha = 0.7f))
+                        .padding(horizontal = 16.dp, vertical = 12.dp),
+                    color = Color.White,
+                    fontSize = 20.sp,
+                    textAlign = TextAlign.Center,
+                    lineHeight = 24.sp
+                )
+            }
+        }
+
+        LaunchedEffect(Unit) { // Runs only ONCE
+            val cameraProvider = ProcessCameraProvider.getInstance(context).get()
+            val preview = CameraXPreview.Builder().setTargetResolution(Size(640, 480)).build()
+                .also { it.setSurfaceProvider(previewView.surfaceProvider) }
+            val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
+            val imageAnalyzer = ImageAnalysis.Builder().setTargetResolution(Size(640, 480))
+                .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST).build()
+
+            imageAnalyzer.setAnalyzer(ContextCompat.getMainExecutor(context)) { imageProxy ->
+                if (isFrozen) {
+                    imageProxy.close()
+                    return@setAnalyzer
+                }
+                
+                val currentTime = System.currentTimeMillis()
+                if (currentTime - lastAnalyzedTimestamp < 1000) {
+                    imageProxy.close()
+                    return@setAnalyzer
                 }
 
-                try {
-                    cameraProvider.unbindAll()
-                    cameraProvider.bindToLifecycle(lifecycleOwner, cameraSelector, preview, imageAnalyzer)
-                } catch (exc: Exception) {
-                    Log.e("CameraX", "Use case binding failed", exc)
-                } 
-            }, ContextCompat.getMainExecutor(context))
+                val mediaImage = imageProxy.image
+                if (mediaImage != null) {
+                    val rotationDegrees = imageProxy.imageInfo.rotationDegrees
+                    val imageWidth = if (rotationDegrees == 90 || rotationDegrees == 270) mediaImage.height else mediaImage.width
+                    val imageHeight = if (rotationDegrees == 90 || rotationDegrees == 270) mediaImage.width else mediaImage.height
+                    val image = InputImage.fromMediaImage(mediaImage, rotationDegrees)
+
+                    recognizer.process(image)
+                        .addOnSuccessListener { visionText ->
+                            val imageCenterX = imageWidth / 2f
+                            val imageCenterY = imageHeight / 2f
+
+                            val foundBlock = visionText.textBlocks.minByOrNull { block ->
+                                val blockCenterY = block.boundingBox?.centerY()?.toFloat() ?: 0f
+                                val blockCenterX = block.boundingBox?.centerX()?.toFloat() ?: 0f
+                                // Calculate squared distance to avoid sqrt
+                                (blockCenterX - imageCenterX).pow(2) + (blockCenterY - imageCenterY).pow(2)
+                            }
+
+                            if (foundBlock != null) {
+                                val newBlockData = TextBlockData(RectF(foundBlock.boundingBox!!), foundBlock.text, imageWidth, imageHeight)
+                                
+                                if (newBlockData.text != highlightedBlock?.text) {
+                                    highlightedBlock = newBlockData
+                                    if (modelReady) {
+                                        germanToEnglishTranslator.translate(newBlockData.text)
+                                            .addOnSuccessListener { translated -> translatedText = translated }
+                                            .addOnFailureListener { translatedText = "Translation failed." }
+                                    } else {
+                                        translatedText = "Translator not ready."
+                                    }
+                                }
+                            } else {
+                                highlightedBlock = null
+                                translatedText = "Point at text to translate"
+                            }
+                        }
+                        .addOnFailureListener { e -> Log.e("TextRecognition", "Recognition failed", e) }
+                        .addOnCompleteListener { imageProxy.close() }
+                    lastAnalyzedTimestamp = currentTime
+                } else {
+                    imageProxy.close()
+                }
+            }
+
+            try {
+                cameraProvider.unbindAll()
+                cameraProvider.bindToLifecycle(lifecycleOwner, cameraSelector, preview, imageAnalyzer)
+            } catch (exc: Exception) {
+                Log.e("CameraX", "Use case binding failed", exc)
+            }
         }
     }
 }
