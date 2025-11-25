@@ -73,6 +73,36 @@ class MainActivity : ComponentActivity() {
     }
 }
 
+fun isMeaningfulText(text: String): Boolean {
+    val t = text.trim()
+
+    // Reject extremely short text
+    if (t.length < 4) return false
+
+    // Reject text with few letters (OCR garbage)
+    val letters = t.count { it.isLetter() }
+    if (letters < 3) return false
+
+    // Reject if too many non-letter characters
+    val ratio = letters.toDouble() / t.length
+    if (ratio < 0.6) return false
+
+    // Reject text with no vowels (most random OCR junk)
+    if (!t.contains(Regex("[aeiouAEIOUäöüÄÖÜ]"))) return false
+
+    // Reject isolated numbers or product codes
+    if (t.matches(Regex("\\d+"))) return false
+
+    // Reject special character noise
+    if (t.contains(Regex("[~`@#%^*_+=<>]"))) return false
+
+    // Accept text containing at least one space or long words
+    if (t.contains(" ") || t.length >= 6) return true
+
+    return false
+}
+
+
 @Composable
 fun CameraPermissionWrapper(modifier: Modifier = Modifier) {
     val context = LocalContext.current
@@ -209,7 +239,8 @@ fun CameraPreviewView(
                     .background(Color.Black.copy(alpha = 0.8f))
                     .padding(32.dp) // Increased padding
                     .verticalScroll(rememberScrollState()), // Make the column scrollable
-                horizontalAlignment = Alignment.CenterHorizontally
+                horizontalAlignment = Alignment.CenterHorizontally,
+                verticalArrangement = Arrangement.Center
             ) {
                 Text(
                     text = frozenTranslatedText,
@@ -262,7 +293,7 @@ fun CameraPreviewView(
                 }
                 
                 val currentTime = System.currentTimeMillis()
-                if (currentTime - lastAnalyzedTimestamp < 1000) {
+                if (currentTime - lastAnalyzedTimestamp < 500) { // Faster analysis
                     imageProxy.close()
                     return@setAnalyzer
                 }
@@ -287,16 +318,25 @@ fun CameraPreviewView(
                             }
 
                             if (foundBlock != null) {
-                                val newBlockData = TextBlockData(RectF(foundBlock.boundingBox!!), foundBlock.text, imageWidth, imageHeight)
-                                
-                                if (newBlockData.text != highlightedBlock?.text) {
+                                // Only update if the text block has changed
+                                if (foundBlock.text != highlightedBlock?.text) {
+                                    val newBlockData = TextBlockData(RectF(foundBlock.boundingBox!!), foundBlock.text, imageWidth, imageHeight)
                                     highlightedBlock = newBlockData
-                                    if (modelReady) {
-                                        germanToEnglishTranslator.translate(newBlockData.text)
-                                            .addOnSuccessListener { translated -> translatedText = translated }
-                                            .addOnFailureListener { translatedText = "Translation failed." }
+
+                                    // --- Meaningful Text Filter ---
+                                    val isMeaningful = isMeaningfulText(newBlockData.text)
+
+
+                                    if (isMeaningful) {
+                                        if (modelReady) {
+                                            germanToEnglishTranslator.translate(newBlockData.text)
+                                                .addOnSuccessListener { translated -> translatedText = translated }
+                                                .addOnFailureListener { translatedText = "Translation failed." }
+                                        } else {
+                                            translatedText = "Translator not ready."
+                                        }
                                     } else {
-                                        translatedText = "Translator not ready."
+                                        translatedText = "..."
                                     }
                                 }
                             } else {
