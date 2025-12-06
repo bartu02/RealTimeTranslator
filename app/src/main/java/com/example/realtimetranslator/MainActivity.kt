@@ -125,11 +125,16 @@ fun CameraPermissionWrapper(modifier: Modifier = Modifier) {
 
 data class TextBlockData(val box: RectF, val text: String, val sourceImageWidth: Int, val sourceImageHeight: Int)
 
-enum class LensMode { INSTANT, HIGHLIGHT, TAP, COPY, PRONUNCIATION }
+enum class LensMode { ONLINE, OFFLINE }
 
 @Composable
-fun ModePicker(modifier: Modifier = Modifier, mode: LensMode, onSelect: (LensMode) -> Unit) {
-    val modes = listOf(LensMode.INSTANT, LensMode.HIGHLIGHT, LensMode.TAP, LensMode.COPY, LensMode.PRONUNCIATION)
+fun ModePicker(
+    modifier: Modifier = Modifier,
+    mode: LensMode,
+    onSelect: (LensMode) -> Unit
+) {
+    val modes = listOf(LensMode.ONLINE, LensMode.OFFLINE)
+
     Row(
         modifier = modifier
             .padding(12.dp)
@@ -139,40 +144,63 @@ fun ModePicker(modifier: Modifier = Modifier, mode: LensMode, onSelect: (LensMod
     ) {
         modes.forEach { m ->
             val selected = m == mode
-            Box(modifier = Modifier
-                .padding(4.dp)
-                .clickable { onSelect(m) }
-                .background(if (selected) Color.White.copy(alpha = 0.12f) else Color.Transparent, RoundedCornerShape(16.dp))
-                .padding(horizontal = 12.dp, vertical = 8.dp)
+            Box(
+                modifier = Modifier
+                    .padding(4.dp)
+                    .clickable { onSelect(m) }
+                    .background(
+                        if (selected) Color.White.copy(alpha = 0.12f) else Color.Transparent,
+                        RoundedCornerShape(16.dp)
+                    )
+                    .padding(horizontal = 16.dp, vertical = 10.dp)
             ) {
                 Text(
                     text = when (m) {
-                        LensMode.INSTANT -> "Instant"
-                        LensMode.HIGHLIGHT -> "Highlight"
-                        LensMode.TAP -> "Tap"
-                        LensMode.COPY -> "Copy"
-                        LensMode.PRONUNCIATION -> "Pronounce"
+                        LensMode.ONLINE -> "Online"
+                        LensMode.OFFLINE -> "Offline"
                     },
                     color = Color.White,
-                    fontSize = 14.sp
+                    fontSize = 15.sp,
                 )
             }
         }
     }
 }
 
-private fun calculateTextSize(paint: Paint, lines: List<String>, maxWidth: Float, maxHeight: Float): Float {
-    var textSize = maxHeight / lines.size * 0.8f
-    paint.textSize = textSize
 
-    lines.forEach { line ->
-        while (paint.measureText(line) > maxWidth && textSize > 6f) {
-            textSize -= 1f
-            paint.textSize = textSize
+private fun calculateTextSizeForBox(
+    paint: Paint,
+    lines: List<String>,
+    targetWidth: Float,
+    targetHeight: Float
+): Float {
+    // Upper and lower limits
+    val minSize = 14f
+    val maxSize = 80f
+
+    var low = minSize
+    var high = maxSize
+    var result = minSize
+
+    // Binary search — fast & accurate
+    repeat(15) {
+        val mid = (low + high) / 2f
+        paint.textSize = mid
+
+        val textHeight = mid * 1.2f * lines.size
+        val maxLineWidth = lines.maxOf { paint.measureText(it) }
+
+        if (maxLineWidth <= targetWidth && textHeight <= targetHeight) {
+            result = mid
+            low = mid
+        } else {
+            high = mid
         }
     }
-    return textSize
+
+    return result
 }
+
 
 private fun blurBitmap(context: Context, bitmap: Bitmap, radius: Float = 15f): Bitmap {
     if (radius == 0f) return bitmap
@@ -254,7 +282,7 @@ fun CameraPreviewView(
     var viewSize by remember { mutableStateOf(ComposeSize.Zero) }
     var latestBitmap by remember { mutableStateOf<Bitmap?>(null) }
 
-    var currentMode by remember { mutableStateOf(LensMode.INSTANT) }
+    var currentMode by remember { mutableStateOf(LensMode.OFFLINE) }
 
     val tts = remember {
         var ttsInstance: TextToSpeech? = null
@@ -295,7 +323,7 @@ fun CameraPreviewView(
 
             Spacer(modifier = Modifier.weight(1f))
 
-            if(currentMode != LensMode.HIGHLIGHT) {
+            if(currentMode != LensMode.OFFLINE) {
                  Column(
                     modifier = Modifier.padding(16.dp),
                     horizontalAlignment = Alignment.CenterHorizontally
@@ -315,12 +343,12 @@ fun CameraPreviewView(
             }
         }
 
-        if (currentMode != LensMode.HIGHLIGHT) {
-             Text("+", modifier = Modifier.align(Alignment.Center), color = Color.White, fontSize = 32.sp)
+        if (currentMode == LensMode.ONLINE || currentMode == LensMode.OFFLINE) {
+        Text("+", modifier = Modifier.align(Alignment.Center), color = Color.White, fontSize = 32.sp)
         }
 
         Canvas(modifier = Modifier.fillMaxSize()) {
-            if (currentMode == LensMode.HIGHLIGHT && translatedBlocks.isNotEmpty() && latestBitmap != null) {
+            if (currentMode == LensMode.OFFLINE && translatedBlocks.isNotEmpty() && latestBitmap != null) {
 
                 fun transformRect(box: RectF, imageWidth: Int, imageHeight: Int): RectF {
                     val viewAspectRatio = viewSize.width / viewSize.height
@@ -348,7 +376,6 @@ fun CameraPreviewView(
 
                     latestBitmap?.let { bmp ->
                         val blurredRegion = blurRegion(context, bmp, blockData.box, 25f)
-
                         if (blurredRegion != null) {
                             val srcSize = androidx.compose.ui.unit.IntSize(blurredRegion.width, blurredRegion.height)
                             val dstOffset = androidx.compose.ui.unit.IntOffset(
@@ -359,7 +386,6 @@ fun CameraPreviewView(
                                 transformedRect.width().toInt().coerceAtLeast(1),
                                 transformedRect.height().toInt().coerceAtLeast(1)
                             )
-
                             drawImage(
                                 image = blurredRegion.asImageBitmap(),
                                 srcOffset = androidx.compose.ui.unit.IntOffset.Zero,
@@ -372,25 +398,63 @@ fun CameraPreviewView(
                         }
                     }
 
-
-
-                    val lines = translated.split("\n")
+                    // --- Text sizing considering width AND height ---
                     val paintText = Paint().apply {
                         color = android.graphics.Color.WHITE
                         textAlign = Paint.Align.LEFT
                         isAntiAlias = true
-                        setShadowLayer(8f, 0f, 0f, android.graphics.Color.BLACK)
+                        isFakeBoldText = true
+                        setShadowLayer(6f, 0f, 0f, android.graphics.Color.BLACK)
                     }
-                    paintText.textSize = calculateTextSize(paintText, lines, transformedRect.width(), transformedRect.height())
 
-                    var y = transformedRect.top + paintText.textSize
-                    lines.forEach { line ->
+                    val maxWidth = transformedRect.width() - 16f // padding left/right
+                    val maxHeight = transformedRect.height() - 8f // padding top/bottom
+                    val words = translated.split(Regex("\\s+"))
+
+                    var textSize = maxHeight / 2f
+                    paintText.textSize = textSize
+                    var finalLines: List<String> = emptyList()
+
+                    while (textSize >= 14f) {
+                        val lines = mutableListOf<String>()
+                        var currentLine = StringBuilder()
+                        words.forEach { word ->
+                            val testLine = if (currentLine.isEmpty()) word else "${currentLine} $word"
+                            if (paintText.measureText(testLine) <= maxWidth) {
+                                currentLine = StringBuilder(testLine)
+                            } else {
+                                lines.add(currentLine.toString())
+                                currentLine = StringBuilder(word)
+                            }
+                        }
+                        if (currentLine.isNotEmpty()) lines.add(currentLine.toString())
+
+                        // check if fits vertically
+                        if (lines.size * textSize * 1.2f <= maxHeight) {
+                            finalLines = lines
+                            break
+                        }
+                        textSize -= 1f
+                        paintText.textSize = textSize
+                        finalLines = lines
+                    }
+
+                    // truncate if still too tall
+                    val maxLines = (maxHeight / (textSize * 1.2f)).toInt().coerceAtLeast(1)
+                    if (finalLines.size > maxLines) {
+                        finalLines = finalLines.take(maxLines - 1) + "..."
+                    }
+
+                    var y = transformedRect.top + textSize
+                    finalLines.forEach { line ->
                         drawContext.canvas.nativeCanvas.drawText(line, transformedRect.left + 8f, y, paintText)
-                        y += paintText.textSize * 1.2f
+                        y += textSize * 1.2f
                     }
                 }
             }
         }
+
+
 
         // --- Camera Logic ---
         LaunchedEffect(Unit) {
@@ -428,7 +492,7 @@ fun CameraPreviewView(
                                     return@addOnSuccessListener
                                 }
 
-                                if (currentMode == LensMode.HIGHLIGHT) {
+                                if (currentMode == LensMode.OFFLINE) {
                                     val allBlocksData = visionText.textBlocks.mapNotNull { block ->
                                         block.boundingBox?.let { TextBlockData(RectF(it), block.text, imageWidth, imageHeight) }
                                     }
