@@ -67,4 +67,9 @@ dependencies {
 
     // ML Kit Translation
     implementation("com.google.mlkit:translate:17.0.2")
+
+    implementation("com.squareup.okhttp3:okhttp:4.12.0")
+
+    implementation("org.json:json:20230227")
+
 }

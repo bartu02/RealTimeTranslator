@@ -1,5 +1,11 @@
 package com.example.realtimetranslator
 
+import kotlinx.coroutines.*
+import okhttp3.OkHttpClient
+import okhttp3.Request
+
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
 import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
@@ -89,6 +95,28 @@ fun isPotentiallyMeaningful(t: String): Boolean {
     if (t.contains(" ") || t.length >= 6) return true
     return false
 }
+
+suspend fun translateBasedOnMode(
+    text: String,
+    mode: LensMode,
+    offlineTranslator: com.google.mlkit.nl.translate.Translator
+): String = withContext(Dispatchers.IO) {
+    if (!isPotentiallyMeaningful(text)) return@withContext text
+
+    return@withContext try {
+        if (mode == LensMode.ONLINE) {
+            translateOnline(text)  // your suspend function
+        } else {
+            // ML Kit offline translator: suspend until result
+            Tasks.await(offlineTranslator.translate(text))
+        }
+    } catch (e: Exception) {
+        text
+    }
+}
+
+
+
 
 @Composable
 fun CameraPermissionWrapper(modifier: Modifier = Modifier) {
@@ -259,6 +287,44 @@ private fun ImageProxy.toBitmap(): Bitmap? {
     return BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
 }
 
+
+// Online translation placeholder
+private val httpClient = OkHttpClient()
+
+suspend fun translateOnline(text: String): String = withContext(Dispatchers.IO) {
+    val apiKey = "DEEPL_API_KEY" // not available due to it's not free
+    try {
+        val encodedText = java.net.URLEncoder.encode(text, "UTF-8")
+        val url = "https://api-free.deepl.com/v2/translate?text=$encodedText&source_lang=DE&target_lang=EN"
+
+        val request = okhttp3.Request.Builder()
+            .url(url)
+            .addHeader("Authorization", "DeepL-Auth-Key $apiKey")
+            .build()
+
+        val response = httpClient.newCall(request).execute()
+        val responseBody = response.body ?: return@withContext text
+
+        responseBody.use { body ->
+            val jsonString = body.string()
+            val jsonObj = org.json.JSONObject(jsonString)
+            val translatedText = jsonObj.getJSONArray("translations")
+                .getJSONObject(0)
+                .getString("text")
+            return@withContext translatedText
+        }
+
+    } catch (e: Exception) {
+        e.printStackTrace()
+        return@withContext text
+    }
+}
+
+
+
+
+
+
 @OptIn(ExperimentalGetImage::class)
 @Composable
 fun CameraPreviewView(
@@ -267,6 +333,26 @@ fun CameraPreviewView(
     val context = LocalContext.current
     val lifecycleOwner = LocalLifecycleOwner.current
     val recognizer = remember { TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS) }
+    val scope = rememberCoroutineScope()
+    val translationCache = remember { mutableMapOf<String, String>() }
+
+
+    suspend fun stableTranslate(text: String, translator: com.google.mlkit.nl.translate.Translator): String =
+        withContext(Dispatchers.IO) {
+            val cleaned = text.trim().replace(Regex("[\\n]+"), " ")
+
+            translationCache[cleaned]?.let { return@withContext it }
+
+            val result = try {
+                // This will block until translation is done
+                Tasks.await(translator.translate(cleaned))
+            } catch (e: Exception) {
+                cleaned
+            }
+
+            translationCache[cleaned] = result
+            result
+        }
 
     val options = remember {
         TranslatorOptions.Builder()
@@ -348,7 +434,9 @@ fun CameraPreviewView(
         }
 
         Canvas(modifier = Modifier.fillMaxSize()) {
-            if (currentMode == LensMode.OFFLINE && translatedBlocks.isNotEmpty() && latestBitmap != null) {
+            if ((currentMode == LensMode.OFFLINE || currentMode == LensMode.ONLINE)
+                && translatedBlocks.isNotEmpty() && latestBitmap != null
+            ) {
 
                 fun transformRect(box: RectF, imageWidth: Int, imageHeight: Int): RectF {
                     val viewAspectRatio = viewSize.width / viewSize.height
@@ -386,15 +474,19 @@ fun CameraPreviewView(
                                 transformedRect.width().toInt().coerceAtLeast(1),
                                 transformedRect.height().toInt().coerceAtLeast(1)
                             )
-                            drawImage(
-                                image = blurredRegion.asImageBitmap(),
-                                srcOffset = androidx.compose.ui.unit.IntOffset.Zero,
-                                srcSize = srcSize,
-                                dstOffset = dstOffset,
-                                dstSize = dstSize,
-                                alpha = 1f,
-                                filterQuality = androidx.compose.ui.graphics.FilterQuality.High
-                            )
+                            latestBitmap?.let { bmp ->
+                                val blurredRegion = blurRegion(context, bmp, blockData.box, 25f)
+                                if (blurredRegion != null) {
+                                    val dst = android.graphics.RectF(
+                                        transformedRect.left,
+                                        transformedRect.top,
+                                        transformedRect.right,
+                                        transformedRect.bottom
+                                    )
+                                    drawContext.canvas.nativeCanvas.drawBitmap(blurredRegion, null, dst, null)
+                                }
+                            }
+
                         }
                     }
 
@@ -492,24 +584,51 @@ fun CameraPreviewView(
                                     return@addOnSuccessListener
                                 }
 
-                                if (currentMode == LensMode.OFFLINE) {
-                                    val allBlocksData = visionText.textBlocks.mapNotNull { block ->
-                                        block.boundingBox?.let { TextBlockData(RectF(it), block.text, imageWidth, imageHeight) }
-                                    }
+                                val allBlocksData = visionText.textBlocks.mapNotNull { block ->
+                                    block.boundingBox?.let { TextBlockData(RectF(it), block.text, imageWidth, imageHeight) }
+                                }
 
-                                    val tasks = allBlocksData.mapNotNull { data ->
-                                        if (isPotentiallyMeaningful(data.text) && modelReady) {
-                                            germanToEnglishTranslator.translate(data.text).continueWith { Pair(data, it.result ?: "") }
-                                        } else null
+                                val mergedBlocks = mutableListOf<TextBlockData>()
+                                allBlocksData.forEach { block ->
+                                    if (mergedBlocks.isEmpty()) mergedBlocks.add(block)
+                                    else {
+                                        val last = mergedBlocks.last()
+                                        if (Math.abs(last.box.top - block.box.top) < 20f) {
+                                            val mergedText = last.text + " " + block.text
+                                            val mergedRect = RectF(
+                                                minOf(last.box.left, block.box.left),
+                                                minOf(last.box.top, block.box.top),
+                                                maxOf(last.box.right, block.box.right),
+                                                maxOf(last.box.bottom, block.box.bottom)
+                                            )
+                                            mergedBlocks[mergedBlocks.lastIndex] = last.copy(text = mergedText, box = mergedRect)
+                                        } else mergedBlocks.add(block)
                                     }
+                                }
 
-                                    if (tasks.isNotEmpty()) {
-                                        Tasks.whenAllSuccess<Pair<TextBlockData, String>>(tasks).addOnSuccessListener { results ->
-                                            translatedBlocks = results.toMap()
+                                // Launch translation coroutine for both online & offline
+                                if (mergedBlocks.isNotEmpty()) {
+                                    scope.launch {
+                                        val results = mergedBlocks.map { data ->
+                                            async {
+                                                val cleaned = data.text.trim().replace(Regex("[\\n]+"), " ")
+                                                val translated = if (currentMode == LensMode.ONLINE) {
+                                                    translateOnline(cleaned)
+                                                } else {
+                                                    stableTranslate(cleaned, germanToEnglishTranslator)
+                                                }
+                                                data to translated
+                                            }
+                                        }.awaitAll()
+
+                                        withContext(Dispatchers.Main) {
+                                            translatedBlocks = results.toMap() // replaces old translations
                                         }
                                     }
 
-                                } else {
+                                }
+
+                                else {
                                     val imageCenterX = imageWidth / 2f
                                     val imageCenterY = imageHeight / 2f
                                     val foundBlock = visionText.textBlocks.minByOrNull { block ->
@@ -521,17 +640,29 @@ fun CameraPreviewView(
                                     if (foundBlock != null) {
                                         val text = foundBlock.text
                                         if (isPotentiallyMeaningful(text)) {
-                                            if (modelReady) {
-                                                germanToEnglishTranslator.translate(text)
-                                                    .addOnSuccessListener { translated -> singleTranslatedText = translated }
-                                                    .addOnFailureListener { singleTranslatedText = "Translation failed." }
+                                            scope.launch {
+                                                val translated = if (currentMode == LensMode.ONLINE) {
+                                                    translateOnline(text) // call your online translator
+                                                } else {
+                                                    translateBasedOnMode(text, LensMode.OFFLINE, germanToEnglishTranslator)
+                                                }
+                                                val prev = translationCache[text]
+                                                if (prev != translated) {
+                                                    translationCache[text] = translated
+                                                    withContext(Dispatchers.Main) {
+                                                        singleTranslatedText = translated
+                                                    }
+                                                }
+
                                             }
+
                                         } else {
                                             singleTranslatedText = "..."
                                         }
                                     } else {
                                         singleTranslatedText = "Point at text to translate"
                                     }
+
                                 }
                             }
                             .addOnFailureListener { e -> Log.e("TextRecognition", "Recognition failed: $e") }
