@@ -2,7 +2,6 @@ package com.example.realtimetranslator
 
 import kotlinx.coroutines.*
 import okhttp3.OkHttpClient
-import okhttp3.Request
 
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -10,7 +9,6 @@ import android.Manifest
 import android.content.Context
 import android.content.pm.PackageManager
 import android.graphics.*
-import android.os.Build
 import android.os.Bundle
 import android.renderscript.Allocation
 import android.renderscript.Element
@@ -31,6 +29,9 @@ import androidx.camera.core.ImageProxy
 import androidx.camera.core.Preview as CameraXPreview
 import androidx.camera.lifecycle.ProcessCameraProvider
 import androidx.camera.view.PreviewView
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.EaseOutBack
+import androidx.compose.animation.core.tween
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -43,17 +44,16 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.geometry.CornerRadius
-import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.geometry.Size as ComposeSize
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
-import androidx.compose.ui.text.AnnotatedString
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -79,8 +79,16 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         setContent {
             RealTimeTranslatorTheme {
-                Scaffold(modifier = Modifier.fillMaxSize()) {
-                    CameraPermissionWrapper(modifier = Modifier.padding(it))
+                var showSplash by remember { mutableStateOf(true) }
+
+                if (showSplash) {
+                    SplashScreen {
+                        showSplash = false
+                    }
+                } else {
+                    Scaffold(modifier = Modifier.fillMaxSize()) {
+                        CameraPermissionWrapper(modifier = Modifier.padding(it))
+                    }
                 }
             }
         }
@@ -172,10 +180,20 @@ fun ModePicker(
     ) {
         modes.forEach { m ->
             val selected = m == mode
+            val isOnlineDisabled = m == LensMode.ONLINE
+
             Box(
                 modifier = Modifier
                     .padding(4.dp)
-                    .clickable { onSelect(m) }
+                    .let { base ->
+                        if (isOnlineDisabled)
+                            base.graphicsLayer(alpha = 0.4f)
+                        else
+                            base
+                    }
+                    .clickable(enabled = !isOnlineDisabled) {
+                        onSelect(m)
+                    }
                     .background(
                         if (selected) Color.White.copy(alpha = 0.12f) else Color.Transparent,
                         RoundedCornerShape(16.dp)
@@ -184,7 +202,7 @@ fun ModePicker(
             ) {
                 Text(
                     text = when (m) {
-                        LensMode.ONLINE -> "Online"
+                        LensMode.ONLINE -> "Online (soon)"
                         LensMode.OFFLINE -> "Offline"
                     },
                     color = Color.White,
@@ -320,6 +338,49 @@ suspend fun translateOnline(text: String): String = withContext(Dispatchers.IO) 
     }
 }
 
+@Composable
+fun SplashScreen(onFinish: () -> Unit) {
+    val alpha = remember { Animatable(0f) }
+    val scale = remember { Animatable(0.8f) }
+
+    LaunchedEffect(Unit) {
+        // Animate alpha and scale together
+        launch {
+            alpha.animateTo(1f, tween(1000))
+        }
+        launch {
+            scale.animateTo(1f, tween(1000, easing = EaseOutBack))
+        }
+        delay(1200) // Keep splash visible for a short moment
+        onFinish()
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(
+                Brush.verticalGradient(
+                    colors = listOf(Color(0xFF2196F3), Color(0xFF21CBF3))
+                )
+            ),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(
+            text = "Real Time Translator",
+            color = Color.White,
+            fontSize = 32.sp,
+            fontWeight = FontWeight.Bold,
+            modifier = Modifier.graphicsLayer {
+                // Use the .value of the Animatable, do NOT assign the Animatable itself
+                scaleX = scale.value
+                scaleY = scale.value
+                this.alpha = alpha.value // note the 'this.alpha', not 'alpha ='
+            }
+        )
+    }
+}
+
+
 
 
 
@@ -386,6 +447,12 @@ fun CameraPreviewView(
     }
 
     var lastAnalyzedTimestamp by remember { mutableStateOf(0L) }
+
+    // --- Stability Vars ---
+    var lastOcrText by remember { mutableStateOf("") }
+    var stableOcrText by remember { mutableStateOf("") }
+    var lastStableTime by remember { mutableStateOf(0L) }
+    var cachedStableMap by remember { mutableStateOf<Map<String, String>>(emptyMap()) }
 
     DisposableEffect(Unit) {
         val conditions = DownloadConditions.Builder().build()
@@ -545,6 +612,35 @@ fun CameraPreviewView(
                 }
             }
         }
+        fun normalizeText(t: String): String {
+            return t.trim()
+                .lowercase()
+                .replace(Regex("\\s+"), " ")
+        }
+
+        fun levenshtein(a: String, b: String): Int {
+            val dp = Array(a.length + 1) { IntArray(b.length + 1) }
+            for (i in 0..a.length) dp[i][0] = i
+            for (j in 0..b.length) dp[0][j] = j
+
+            for (i in 1..a.length) {
+                for (j in 1..b.length) {
+                    dp[i][j] = minOf(
+                        dp[i - 1][j] + 1,
+                        dp[i][j - 1] + 1,
+                        dp[i - 1][j - 1] + if (a[i - 1] == b[j - 1]) 0 else 1
+                    )
+                }
+            }
+
+            return dp[a.length][b.length]
+        }
+
+        fun similarity(a: String, b: String): Double {
+            val maxLen = maxOf(a.length, b.length).toDouble()
+            if (maxLen == 0.0) return 1.0
+            return 1.0 - (levenshtein(a, b) / maxLen)
+        }
 
 
 
@@ -608,25 +704,63 @@ fun CameraPreviewView(
 
                                 // Launch translation coroutine for both online & offline
                                 if (mergedBlocks.isNotEmpty()) {
-                                    scope.launch {
-                                        val results = mergedBlocks.map { data ->
-                                            async {
-                                                val cleaned = data.text.trim().replace(Regex("[\\n]+"), " ")
-                                                val translated = if (currentMode == LensMode.ONLINE) {
-                                                    translateOnline(cleaned)
-                                                } else {
-                                                    stableTranslate(cleaned, germanToEnglishTranslator)
-                                                }
-                                                data to translated
-                                            }
-                                        }.awaitAll()
 
-                                        withContext(Dispatchers.Main) {
-                                            translatedBlocks = results.toMap() // replaces old translations
+                                    // Join all merged block text into one single string to compare stability
+                                    val currentMergedText = mergedBlocks.joinToString(" ") { it.text }
+                                    val normalized = normalizeText(currentMergedText)
+                                    val now = System.currentTimeMillis()
+
+                                    // First frame of text ever → accept immediately
+                                    if (lastOcrText.isEmpty()) {
+                                        lastOcrText = normalized
+                                        lastStableTime = now
+                                    }
+
+                                    // Compare stability
+                                    val sim = similarity(normalized, lastOcrText)
+
+                                    // If text changed too much, reset timer
+                                    if (sim < 0.70) {
+                                        lastOcrText = normalized
+                                        lastStableTime = now
+                                        return@addOnSuccessListener
+                                    }
+
+                                    // Require at least 200ms of stable text
+                                    if (now - lastStableTime < 200) {
+                                        return@addOnSuccessListener
+                                    }
+
+                                    // Only translate when OCR text is NEW and STABLE
+                                    if (normalized != stableOcrText) {
+                                        stableOcrText = normalized
+
+                                        scope.launch {
+                                            val results = mergedBlocks.map { data ->
+                                                async {
+                                                    val cleaned = data.text.trim().replace(Regex("[\\n]+"), " ")
+
+                                                    // Use cache to avoid re-translating same text blocks
+                                                    val cached = cachedStableMap[cleaned]
+                                                    val translated = if (cached != null) cached else {
+                                                        val t = stableTranslate(cleaned, germanToEnglishTranslator)
+                                                        cachedStableMap = cachedStableMap + (cleaned to t)
+                                                        t
+                                                    }
+
+                                                    data to translated
+                                                }
+                                            }.awaitAll()
+
+                                            withContext(Dispatchers.Main) {
+                                                translatedBlocks = results.toMap()
+                                            }
                                         }
                                     }
 
+                                    return@addOnSuccessListener
                                 }
+
 
                                 else {
                                     val imageCenterX = imageWidth / 2f
