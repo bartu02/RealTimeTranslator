@@ -2,6 +2,10 @@ package com.example.realtimetranslator
 
 import kotlinx.coroutines.*
 import okhttp3.OkHttpClient
+import kotlin.math.pow
+
+import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.ui.input.pointer.pointerInput
 
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -14,7 +18,6 @@ import android.renderscript.Allocation
 import android.renderscript.Element
 import android.renderscript.RenderScript
 import android.renderscript.ScriptIntrinsicBlur
-import android.speech.tts.TextToSpeech
 import android.util.Log
 import android.util.Size
 import androidx.activity.ComponentActivity
@@ -44,11 +47,14 @@ import androidx.compose.material3.Text
 import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.geometry.Size as ComposeSize
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.input.pointer.PointerInputChange
 import androidx.compose.ui.layout.onGloballyPositioned
 import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
@@ -70,8 +76,8 @@ import com.google.mlkit.vision.common.InputImage
 import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import java.io.ByteArrayOutputStream
-import java.util.Locale
-import kotlin.math.pow
+import kotlin.math.absoluteValue
+
 
 
 class MainActivity : ComponentActivity() {
@@ -95,14 +101,37 @@ class MainActivity : ComponentActivity() {
     }
 }
 
-fun isPotentiallyMeaningful(t: String): Boolean {
+fun isPotentiallyMeaningful(text: String): Boolean {
+    val t = text.trim()
+
     if (t.length < 3) return false
+
+    // Count letters only
+    val letters = t.count { it.isLetter() }
+    val digits = t.count { it.isDigit() }
+
+    // Mostly letters
+    if (letters.toDouble() / t.length < 0.6) return false
+
+    // Reject if too many digits mixed in
+    if (digits > letters / 2) return false
+
+    // Must contain a vowel (helps reject OCR junk)
     if (!t.contains(Regex("[aeiouAEIOUäöüÄÖÜ]"))) return false
-    if (t.matches(Regex("\\d+"))) return false
-    if (t.contains(Regex("[~`@#%^*_+=<>]"))) return false
-    if (t.contains(" ") || t.length >= 6) return true
-    return false
+
+    // Reject repeated nonsense (aaaa, llll, ||||)
+    if (t.all { it == t[0] }) return false
+
+    // Reject symbol-heavy noise
+    if (t.contains(Regex("[~`@#%^*_+=<>|]"))) return false
+
+    // Reject suspicious OCR combos
+    if (t.contains(Regex("[Il1|]{3,}"))) return false
+
+    return true
 }
+
+
 
 suspend fun translateBasedOnMode(
     text: String,
@@ -382,7 +411,9 @@ fun SplashScreen(onFinish: () -> Unit) {
 
 
 
-
+enum class Corner {
+    TOP_LEFT, TOP_RIGHT, BOTTOM_LEFT, BOTTOM_RIGHT
+}
 
 
 
@@ -396,6 +427,9 @@ fun CameraPreviewView(
     val recognizer = remember { TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS) }
     val scope = rememberCoroutineScope()
     val translationCache = remember { mutableMapOf<String, String>() }
+    var resizingCorner by remember { mutableStateOf<Corner?>(null) }
+
+
 
 
     suspend fun stableTranslate(text: String, translator: com.google.mlkit.nl.translate.Translator): String =
@@ -414,6 +448,60 @@ fun CameraPreviewView(
             translationCache[cleaned] = result
             result
         }
+    var viewSize by remember { mutableStateOf(ComposeSize.Zero) }
+
+    fun transformRect(box: RectF, imageWidth: Int, imageHeight: Int): RectF {
+        val viewAspectRatio = viewSize.width / viewSize.height
+        val imageAspectRatio = imageWidth.toFloat() / imageHeight.toFloat()
+        val scale: Float
+        var offsetX = 0f
+        var offsetY = 0f
+        if (viewAspectRatio > imageAspectRatio) {
+            scale = viewSize.height / imageHeight
+            offsetX = (viewSize.width - imageWidth * scale) / 2
+        } else {
+            scale = viewSize.width / imageWidth
+            offsetY = (viewSize.height - imageHeight * scale) / 2
+        }
+        return RectF(
+            offsetX + box.left * scale,
+            offsetY + box.top * scale,
+            offsetX + box.right * scale,
+            offsetY + box.bottom * scale
+        )
+    }
+    fun chunkTextSmart(
+        text: String,
+        minLen: Int = 45,
+        maxLen: Int = 110
+    ): List<String> {
+        val cleaned = text.trim().replace(Regex("\\s+"), " ")
+        if (cleaned.length <= maxLen) return listOf(cleaned)
+
+        val words = cleaned.split(" ")
+        val chunks = mutableListOf<String>()
+        var current = StringBuilder()
+
+        for (word in words) {
+            if ((current.length + word.length + 1) <= maxLen) {
+                if (current.isNotEmpty()) current.append(" ")
+                current.append(word)
+            } else {
+                if (current.length >= minLen) {
+                    chunks.add(current.toString())
+                }
+                current = StringBuilder(word)
+            }
+        }
+
+        if (current.length >= minLen) {
+            chunks.add(current.toString())
+        }
+
+        return chunks.take(2)
+    }
+
+
 
     val options = remember {
         TranslatorOptions.Builder()
@@ -426,25 +514,18 @@ fun CameraPreviewView(
 
     var translatedBlocks by remember { mutableStateOf<Map<TextBlockData, String>>(emptyMap()) }
     var singleTranslatedText by remember { mutableStateOf("Point at text to translate") }
-    var viewSize by remember { mutableStateOf(ComposeSize.Zero) }
+    var selectionBox by remember {
+        mutableStateOf(
+            RectF(
+                0f, 0f, 0f, 0f
+            )
+        )
+    }
+
     var latestBitmap by remember { mutableStateOf<Bitmap?>(null) }
 
     var currentMode by remember { mutableStateOf(LensMode.OFFLINE) }
 
-    val tts = remember {
-        var ttsInstance: TextToSpeech? = null
-        val listener = TextToSpeech.OnInitListener { status ->
-            if (status == TextToSpeech.SUCCESS) {
-                ttsInstance?.language = Locale.ENGLISH
-            }
-        }
-        ttsInstance = TextToSpeech(context, listener)
-        ttsInstance
-    }
-    val clipboardManager = LocalClipboardManager.current
-    DisposableEffect(Unit) {
-        onDispose { tts?.shutdown() }
-    }
 
     var lastAnalyzedTimestamp by remember { mutableStateOf(0L) }
 
@@ -463,6 +544,16 @@ fun CameraPreviewView(
     }
 
     Box(modifier = modifier.onGloballyPositioned { viewSize = it.size.toSize() }) {
+        if (selectionBox.width() == 0f && selectionBox.height() == 0f && viewSize.width > 0f && viewSize.height > 0f) {
+            val boxSize = 300f
+            selectionBox = RectF(
+                viewSize.width / 2 - boxSize / 2,
+                viewSize.height / 2 - boxSize / 2,
+                viewSize.width / 2 + boxSize / 2,
+                viewSize.height / 2 + boxSize / 2
+            )
+        }
+
         val previewView = remember {
             PreviewView(context).apply { this.scaleType = PreviewView.ScaleType.FIT_CENTER }
         }
@@ -477,7 +568,7 @@ fun CameraPreviewView(
             Spacer(modifier = Modifier.weight(1f))
 
             if(currentMode != LensMode.OFFLINE) {
-                 Column(
+                Column(
                     modifier = Modifier.padding(16.dp),
                     horizontalAlignment = Alignment.CenterHorizontally
                 ) {
@@ -496,33 +587,110 @@ fun CameraPreviewView(
             }
         }
 
-        if (currentMode == LensMode.ONLINE || currentMode == LensMode.OFFLINE) {
-        Text("+", modifier = Modifier.align(Alignment.Center), color = Color.White, fontSize = 32.sp)
-        }
+//        if (currentMode == LensMode.ONLINE || currentMode == LensMode.OFFLINE) {
+//            Text("+", modifier = Modifier.align(Alignment.Center), color = Color.White, fontSize = 32.sp)
+//        }
 
-        Canvas(modifier = Modifier.fillMaxSize()) {
+
+
+        Canvas(
+            modifier = Modifier
+                .fillMaxSize()
+                .pointerInput(Unit) {
+                    detectDragGestures(
+                        onDragStart = { offset ->
+                            val visualCornerRadius = 20f   // keeps the visual small
+                            val hitboxCornerRadius = 80f    // bigger hit area for touch
+
+                            resizingCorner = when {
+                                (offset.x - selectionBox.left).absoluteValue < hitboxCornerRadius &&
+                                        (offset.y - selectionBox.top).absoluteValue < hitboxCornerRadius -> Corner.TOP_LEFT
+                                (offset.x - selectionBox.right).absoluteValue < hitboxCornerRadius &&
+                                        (offset.y - selectionBox.top).absoluteValue < hitboxCornerRadius -> Corner.TOP_RIGHT
+                                (offset.x - selectionBox.left).absoluteValue < hitboxCornerRadius &&
+                                        (offset.y - selectionBox.bottom).absoluteValue < hitboxCornerRadius -> Corner.BOTTOM_LEFT
+                                (offset.x - selectionBox.right).absoluteValue < hitboxCornerRadius &&
+                                        (offset.y - selectionBox.bottom).absoluteValue < hitboxCornerRadius -> Corner.BOTTOM_RIGHT
+                                else -> null
+                            }
+                        },
+                        onDrag = { change, dragAmount ->
+                            change.consume()
+                            if (resizingCorner != null) {
+                                selectionBox = when (resizingCorner) {
+                                    Corner.TOP_LEFT -> selectionBox.apply {
+                                        left += dragAmount.x
+                                        top += dragAmount.y
+                                    }
+                                    Corner.TOP_RIGHT -> selectionBox.apply {
+                                        right += dragAmount.x
+                                        top += dragAmount.y
+                                    }
+                                    Corner.BOTTOM_LEFT -> selectionBox.apply {
+                                        left += dragAmount.x
+                                        bottom += dragAmount.y
+                                    }
+                                    Corner.BOTTOM_RIGHT -> selectionBox.apply {
+                                        right += dragAmount.x
+                                        bottom += dragAmount.y
+                                    }
+                                    else -> selectionBox
+                                }
+                            } else {
+                                selectionBox = RectF(
+                                    selectionBox.left + dragAmount.x,
+                                    selectionBox.top + dragAmount.y,
+                                    selectionBox.right + dragAmount.x,
+                                    selectionBox.bottom + dragAmount.y
+                                )
+                            }
+                        },
+                        onDragEnd = { resizingCorner = null }
+                    )
+                }
+        ) {
+
+            drawRect(
+                color = Color.White.copy(alpha = 0.3f),
+                topLeft = Offset(selectionBox.left, selectionBox.top),
+                size = ComposeSize(selectionBox.width(), selectionBox.height()),
+                style = Stroke(width = 3f)
+            )
+
+            val handleRadius = 12f
+            val handleColor = Color.White
+            val highlightColor = Color.Yellow.copy(alpha = 0.7f)
+
+            // Draw handles
+            fun drawHandle(x: Float, y: Float, corner: Corner) {
+                val color = if (resizingCorner == corner) highlightColor else handleColor
+                drawCircle(color, handleRadius, Offset(x, y))
+            }
+
+            drawHandle(selectionBox.left, selectionBox.top, Corner.TOP_LEFT)
+            drawHandle(selectionBox.right, selectionBox.top, Corner.TOP_RIGHT)
+            drawHandle(selectionBox.left, selectionBox.bottom, Corner.BOTTOM_LEFT)
+            drawHandle(selectionBox.right, selectionBox.bottom, Corner.BOTTOM_RIGHT)
+
+
+
             if ((currentMode == LensMode.OFFLINE || currentMode == LensMode.ONLINE)
                 && translatedBlocks.isNotEmpty() && latestBitmap != null
             ) {
 
-                fun transformRect(box: RectF, imageWidth: Int, imageHeight: Int): RectF {
-                    val viewAspectRatio = viewSize.width / viewSize.height
-                    val imageAspectRatio = imageWidth.toFloat() / imageHeight.toFloat()
-                    val scale: Float
-                    var offsetX = 0f
-                    var offsetY = 0f
-                    if (viewAspectRatio > imageAspectRatio) {
-                        scale = viewSize.height / imageHeight
-                        offsetX = (viewSize.width - imageWidth * scale) / 2
-                    } else {
-                        scale = viewSize.width / imageWidth
-                        offsetY = (viewSize.height - imageHeight * scale) / 2
+                drawContext.canvas.nativeCanvas.apply {
+                    val paint = android.graphics.Paint().apply {
+                        color = android.graphics.Color.WHITE
+                        textSize = 32f
+                        isAntiAlias = true
+                        textAlign = android.graphics.Paint.Align.CENTER
+                        setShadowLayer(6f, 0f, 0f, android.graphics.Color.BLACK)
                     }
-                    return RectF(
-                        offsetX + box.left * scale,
-                        offsetY + box.top * scale,
-                        offsetX + box.right * scale,
-                        offsetY + box.bottom * scale
+                    drawText(
+                        "${selectionBox.width().toInt()} × ${selectionBox.height().toInt()} px",
+                        selectionBox.centerX(),
+                        selectionBox.top - 16f, // slightly above the rectangle
+                        paint
                     )
                 }
 
@@ -649,14 +817,14 @@ fun CameraPreviewView(
             val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
             cameraProviderFuture.addListener({
                 val cameraProvider = cameraProviderFuture.get()
-                val preview = CameraXPreview.Builder().setTargetResolution(Size(640, 480)).build()
+                val preview = CameraXPreview.Builder().setTargetResolution(Size(1280, 720)).build()
                     .also { it.setSurfaceProvider(previewView.surfaceProvider) }
                 val cameraSelector = CameraSelector.DEFAULT_BACK_CAMERA
-                val imageAnalyzer = ImageAnalysis.Builder().setTargetResolution(Size(640, 480))
+                val imageAnalyzer = ImageAnalysis.Builder().setTargetResolution(Size(1280, 720))
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST).build()
 
                 imageAnalyzer.setAnalyzer(ContextCompat.getMainExecutor(context)) { imageProxy ->
-                    val MIN_TRANSLATE_INTERVAL = 2500L
+                    val MIN_TRANSLATE_INTERVAL = 1750L
                     val currentTime = System.currentTimeMillis()
                     if (currentTime - lastAnalyzedTimestamp < MIN_TRANSLATE_INTERVAL) {
                         imageProxy.close()
@@ -681,7 +849,13 @@ fun CameraPreviewView(
                                 }
 
                                 val allBlocksData = visionText.textBlocks.mapNotNull { block ->
-                                    block.boundingBox?.let { TextBlockData(RectF(it), block.text, imageWidth, imageHeight) }
+                                    block.boundingBox?.let {
+                                        val rect = RectF(it).apply {
+                                            inset(-8f, -8f) // expand box
+                                        }
+                                        TextBlockData(rect, block.text, imageWidth, imageHeight)
+                                    }
+
                                 }
 
                                 val mergedBlocks = mutableListOf<TextBlockData>()
@@ -704,9 +878,27 @@ fun CameraPreviewView(
 
                                 // Launch translation coroutine for both online & offline
                                 if (mergedBlocks.isNotEmpty()) {
+                                    val imageCenterX = imageWidth / 2f
+                                    val imageCenterY = imageHeight / 2f
+
+                                    val transformedBlocks: List<Pair<TextBlockData, RectF>> = mergedBlocks.map { block ->
+                                        block to transformRect(block.box, block.sourceImageWidth, block.sourceImageHeight)
+                                    }
+
+                                    val nearbyBlocks: List<TextBlockData> = transformedBlocks
+                                        .filter { pair ->
+                                            val rect = pair.second
+                                            selectionBox.contains(rect.centerX(), rect.centerY())
+                                        }
+                                        .map { pair -> pair.first } // get original block
+
+
+
+
+                                    if (nearbyBlocks.isEmpty()) return@addOnSuccessListener
 
                                     // Join all merged block text into one single string to compare stability
-                                    val currentMergedText = mergedBlocks.joinToString(" ") { it.text }
+                                    val currentMergedText = nearbyBlocks.joinToString(" ") { it.text }
                                     val normalized = normalizeText(currentMergedText)
                                     val now = System.currentTimeMillis()
 
@@ -720,7 +912,7 @@ fun CameraPreviewView(
                                     val sim = similarity(normalized, lastOcrText)
 
                                     // If text changed too much, reset timer
-                                    if (sim < 0.70) {
+                                    if (sim < 0.65) {
                                         lastOcrText = normalized
                                         lastStableTime = now
                                         return@addOnSuccessListener
@@ -736,19 +928,32 @@ fun CameraPreviewView(
                                         stableOcrText = normalized
 
                                         scope.launch {
-                                            val results = mergedBlocks.map { data ->
-                                                async {
-                                                    val cleaned = data.text.trim().replace(Regex("[\\n]+"), " ")
+                                            val results = nearbyBlocks.flatMap { data ->
+                                                val cleaned = data.text.trim().replace(Regex("[\\n]+"), " ")
 
-                                                    // Use cache to avoid re-translating same text blocks
-                                                    val cached = cachedStableMap[cleaned]
-                                                    val translated = if (cached != null) cached else {
-                                                        val t = stableTranslate(cleaned, germanToEnglishTranslator)
-                                                        cachedStableMap = cachedStableMap + (cleaned to t)
-                                                        t
+                                                //  Ignore insanely long OCR garbage
+                                                if (cleaned.length > 250) return@flatMap emptyList()
+
+                                                val parts = if (cleaned.length > 200) {
+                                                    chunkTextSmart(cleaned)
+                                                } else {
+                                                    listOf(cleaned)
+                                                }
+
+                                                parts.mapNotNull { part ->
+                                                    if (!isPotentiallyMeaningful(part)) return@mapNotNull null
+
+                                                    async {
+                                                        val cached = cachedStableMap[part]
+                                                        val translated = if (cached != null) cached else {
+                                                            val t = stableTranslate(part, germanToEnglishTranslator)
+                                                            cachedStableMap = cachedStableMap + (part to t)
+                                                            t
+                                                        }
+
+                                                        // reuse same box for now
+                                                        data.copy(text = part) to translated
                                                     }
-
-                                                    data to translated
                                                 }
                                             }.awaitAll()
 
