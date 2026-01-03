@@ -103,33 +103,30 @@ class MainActivity : ComponentActivity() {
 
 fun isPotentiallyMeaningful(text: String): Boolean {
     val t = text.trim()
+    if (t.length < 2) return false  // allow 2-letter words like "im", "an"
 
-    if (t.length < 3) return false
-
-    // Count letters only
     val letters = t.count { it.isLetter() }
     val digits = t.count { it.isDigit() }
 
-    // Mostly letters
-    if (letters.toDouble() / t.length < 0.6) return false
+    // Mostly letters, allow some digits
+    if (letters.toDouble() / t.length < 0.5) return false
+    if (digits > letters) return false  // too many digits → likely junk
 
-    // Reject if too many digits mixed in
-    if (digits > letters / 2) return false
+    // Must contain a vowel or ß or umlaut if > 5 chars
+    if (t.length > 5 && !t.contains(Regex("[aeiouAEIOUäöüÄÖÜß]"))) return false
 
-    // Must contain a vowel (helps reject OCR junk)
-    if (!t.contains(Regex("[aeiouAEIOUäöüÄÖÜ]"))) return false
-
-    // Reject repeated nonsense (aaaa, llll, ||||)
+    // Reject repeated nonsense (aaaa, ||||, 1111)
     if (t.all { it == t[0] }) return false
 
     // Reject symbol-heavy noise
     if (t.contains(Regex("[~`@#%^*_+=<>|]"))) return false
 
-    // Reject suspicious OCR combos
+    // Reject sequences of suspicious OCR characters
     if (t.contains(Regex("[Il1|]{3,}"))) return false
 
     return true
 }
+
 
 
 
@@ -616,32 +613,44 @@ fun CameraPreviewView(
                         },
                         onDrag = { change, dragAmount ->
                             change.consume()
-                            if (resizingCorner != null) {
-                                selectionBox = when (resizingCorner) {
-                                    Corner.TOP_LEFT -> selectionBox.apply {
-                                        left += dragAmount.x
-                                        top += dragAmount.y
-                                    }
-                                    Corner.TOP_RIGHT -> selectionBox.apply {
-                                        right += dragAmount.x
-                                        top += dragAmount.y
-                                    }
-                                    Corner.BOTTOM_LEFT -> selectionBox.apply {
-                                        left += dragAmount.x
-                                        bottom += dragAmount.y
-                                    }
-                                    Corner.BOTTOM_RIGHT -> selectionBox.apply {
-                                        right += dragAmount.x
-                                        bottom += dragAmount.y
-                                    }
-                                    else -> selectionBox
-                                }
-                            } else {
-                                selectionBox = RectF(
-                                    selectionBox.left + dragAmount.x,
-                                    selectionBox.top + dragAmount.y,
-                                    selectionBox.right + dragAmount.x,
-                                    selectionBox.bottom + dragAmount.y
+
+                            val dx = dragAmount.x
+                            val dy = dragAmount.y
+                            selectionBox = when (resizingCorner) {
+
+                                Corner.TOP_LEFT -> RectF(
+                                    selectionBox.left + dx,
+                                    selectionBox.top + dy,
+                                    selectionBox.right,
+                                    selectionBox.bottom
+                                )
+
+                                Corner.TOP_RIGHT -> RectF(
+                                    selectionBox.left,
+                                    selectionBox.top + dy,
+                                    selectionBox.right + dx,
+                                    selectionBox.bottom
+                                )
+
+                                Corner.BOTTOM_LEFT -> RectF(
+                                    selectionBox.left + dx,
+                                    selectionBox.top,
+                                    selectionBox.right,
+                                    selectionBox.bottom + dy
+                                )
+
+                                Corner.BOTTOM_RIGHT -> RectF(
+                                    selectionBox.left,
+                                    selectionBox.top,
+                                    selectionBox.right + dx,
+                                    selectionBox.bottom + dy
+                                )
+
+                                null -> RectF(
+                                    selectionBox.left + dx,
+                                    selectionBox.top + dy,
+                                    selectionBox.right + dx,
+                                    selectionBox.bottom + dy
                                 )
                             }
                         },
@@ -824,7 +833,7 @@ fun CameraPreviewView(
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST).build()
 
                 imageAnalyzer.setAnalyzer(ContextCompat.getMainExecutor(context)) { imageProxy ->
-                    val MIN_TRANSLATE_INTERVAL = 1750L
+                    val MIN_TRANSLATE_INTERVAL = 1250L
                     val currentTime = System.currentTimeMillis()
                     if (currentTime - lastAnalyzedTimestamp < MIN_TRANSLATE_INTERVAL) {
                         imageProxy.close()
@@ -844,6 +853,7 @@ fun CameraPreviewView(
                             .addOnSuccessListener { visionText ->
                                 if (visionText.textBlocks.isEmpty()) {
                                     translatedBlocks = emptyMap()
+                                    stableOcrText = ""  // clear the previous stable translation
                                     singleTranslatedText = "Point at text to translate"
                                     return@addOnSuccessListener
                                 }
@@ -912,14 +922,14 @@ fun CameraPreviewView(
                                     val sim = similarity(normalized, lastOcrText)
 
                                     // If text changed too much, reset timer
-                                    if (sim < 0.65) {
+                                    if (sim < 0.50) {
                                         lastOcrText = normalized
                                         lastStableTime = now
                                         return@addOnSuccessListener
                                     }
 
                                     // Require at least 200ms of stable text
-                                    if (now - lastStableTime < 200) {
+                                    if (now - lastStableTime < 100) {
                                         return@addOnSuccessListener
                                     }
 
@@ -932,9 +942,9 @@ fun CameraPreviewView(
                                                 val cleaned = data.text.trim().replace(Regex("[\\n]+"), " ")
 
                                                 //  Ignore insanely long OCR garbage
-                                                if (cleaned.length > 250) return@flatMap emptyList()
+                                                if (cleaned.length > 450) return@flatMap emptyList()
 
-                                                val parts = if (cleaned.length > 200) {
+                                                val parts = if (cleaned.length > 449) {
                                                     chunkTextSmart(cleaned)
                                                 } else {
                                                     listOf(cleaned)
