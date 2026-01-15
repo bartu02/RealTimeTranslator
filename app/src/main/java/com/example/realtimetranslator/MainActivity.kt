@@ -2,7 +2,6 @@ package com.example.realtimetranslator
 
 import kotlinx.coroutines.*
 import okhttp3.OkHttpClient
-import kotlin.math.pow
 
 import androidx.compose.foundation.gestures.detectDragGestures
 import androidx.compose.ui.input.pointer.pointerInput
@@ -54,9 +53,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.nativeCanvas
-import androidx.compose.ui.input.pointer.PointerInputChange
 import androidx.compose.ui.layout.onGloballyPositioned
-import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.LocalLifecycleOwner
 import androidx.compose.ui.text.font.FontWeight
@@ -77,7 +74,7 @@ import com.google.mlkit.vision.text.TextRecognition
 import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import java.io.ByteArrayOutputStream
 import kotlin.math.absoluteValue
-
+import java.util.concurrent.Executors
 
 
 class MainActivity : ComponentActivity() {
@@ -126,30 +123,6 @@ fun isPotentiallyMeaningful(text: String): Boolean {
 
     return true
 }
-
-
-
-
-suspend fun translateBasedOnMode(
-    text: String,
-    mode: LensMode,
-    offlineTranslator: com.google.mlkit.nl.translate.Translator
-): String = withContext(Dispatchers.IO) {
-    if (!isPotentiallyMeaningful(text)) return@withContext text
-
-    return@withContext try {
-        if (mode == LensMode.ONLINE) {
-            translateOnline(text)  // your suspend function
-        } else {
-            // ML Kit offline translator: suspend until result
-            Tasks.await(offlineTranslator.translate(text))
-        }
-    } catch (e: Exception) {
-        text
-    }
-}
-
-
 
 
 @Composable
@@ -237,40 +210,6 @@ fun ModePicker(
             }
         }
     }
-}
-
-
-private fun calculateTextSizeForBox(
-    paint: Paint,
-    lines: List<String>,
-    targetWidth: Float,
-    targetHeight: Float
-): Float {
-    // Upper and lower limits
-    val minSize = 14f
-    val maxSize = 80f
-
-    var low = minSize
-    var high = maxSize
-    var result = minSize
-
-    // Binary search — fast & accurate
-    repeat(15) {
-        val mid = (low + high) / 2f
-        paint.textSize = mid
-
-        val textHeight = mid * 1.2f * lines.size
-        val maxLineWidth = lines.maxOf { paint.measureText(it) }
-
-        if (maxLineWidth <= targetWidth && textHeight <= targetHeight) {
-            result = mid
-            low = mid
-        } else {
-            high = mid
-        }
-    }
-
-    return result
 }
 
 
@@ -467,37 +406,6 @@ fun CameraPreviewView(
             offsetY + box.bottom * scale
         )
     }
-    fun chunkTextSmart(
-        text: String,
-        minLen: Int = 45,
-        maxLen: Int = 110
-    ): List<String> {
-        val cleaned = text.trim().replace(Regex("\\s+"), " ")
-        if (cleaned.length <= maxLen) return listOf(cleaned)
-
-        val words = cleaned.split(" ")
-        val chunks = mutableListOf<String>()
-        var current = StringBuilder()
-
-        for (word in words) {
-            if ((current.length + word.length + 1) <= maxLen) {
-                if (current.isNotEmpty()) current.append(" ")
-                current.append(word)
-            } else {
-                if (current.length >= minLen) {
-                    chunks.add(current.toString())
-                }
-                current = StringBuilder(word)
-            }
-        }
-
-        if (current.length >= minLen) {
-            chunks.add(current.toString())
-        }
-
-        return chunks.take(2)
-    }
-
 
 
     val options = remember {
@@ -709,28 +617,13 @@ fun CameraPreviewView(
                     latestBitmap?.let { bmp ->
                         val blurredRegion = blurRegion(context, bmp, blockData.box, 25f)
                         if (blurredRegion != null) {
-                            val srcSize = androidx.compose.ui.unit.IntSize(blurredRegion.width, blurredRegion.height)
-                            val dstOffset = androidx.compose.ui.unit.IntOffset(
-                                transformedRect.left.toInt().coerceAtLeast(0),
-                                transformedRect.top.toInt().coerceAtLeast(0)
+                            val dst = android.graphics.RectF(
+                                transformedRect.left,
+                                transformedRect.top,
+                                transformedRect.right,
+                                transformedRect.bottom
                             )
-                            val dstSize = androidx.compose.ui.unit.IntSize(
-                                transformedRect.width().toInt().coerceAtLeast(1),
-                                transformedRect.height().toInt().coerceAtLeast(1)
-                            )
-                            latestBitmap?.let { bmp ->
-                                val blurredRegion = blurRegion(context, bmp, blockData.box, 25f)
-                                if (blurredRegion != null) {
-                                    val dst = android.graphics.RectF(
-                                        transformedRect.left,
-                                        transformedRect.top,
-                                        transformedRect.right,
-                                        transformedRect.bottom
-                                    )
-                                    drawContext.canvas.nativeCanvas.drawBitmap(blurredRegion, null, dst, null)
-                                }
-                            }
-
+                            drawContext.canvas.nativeCanvas.drawBitmap(blurredRegion, null, dst, null)
                         }
                     }
 
@@ -819,6 +712,7 @@ fun CameraPreviewView(
             return 1.0 - (levenshtein(a, b) / maxLen)
         }
 
+        val analysisExecutor = Executors.newSingleThreadExecutor()
 
 
         // --- Camera Logic ---
@@ -832,8 +726,9 @@ fun CameraPreviewView(
                 val imageAnalyzer = ImageAnalysis.Builder().setTargetResolution(Size(1280, 720))
                     .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST).build()
 
-                imageAnalyzer.setAnalyzer(ContextCompat.getMainExecutor(context)) { imageProxy ->
-                    val MIN_TRANSLATE_INTERVAL = 1250L
+                imageAnalyzer.setAnalyzer(analysisExecutor) { imageProxy ->
+
+                val MIN_TRANSLATE_INTERVAL = 1500L
                     val currentTime = System.currentTimeMillis()
                     if (currentTime - lastAnalyzedTimestamp < MIN_TRANSLATE_INTERVAL) {
                         imageProxy.close()
@@ -841,186 +736,130 @@ fun CameraPreviewView(
                     }
 
                     val mediaImage = imageProxy.image
-                    if (mediaImage != null) {
-                        val rotationDegrees = imageProxy.imageInfo.rotationDegrees
-                        val imageWidth = if (rotationDegrees == 90 || rotationDegrees == 270) mediaImage.height else mediaImage.width
-                        val imageHeight = if (rotationDegrees == 90 || rotationDegrees == 270) mediaImage.width else mediaImage.height
+                    if (mediaImage == null) {
+                        imageProxy.close()
+                        return@setAnalyzer
+                    }
 
-                        latestBitmap = imageProxy.toBitmap()?.rotate(rotationDegrees.toFloat())
-                        val image = InputImage.fromMediaImage(mediaImage, rotationDegrees)
+                    val rotationDegrees = imageProxy.imageInfo.rotationDegrees
 
-                        recognizer.process(image)
-                            .addOnSuccessListener { visionText ->
-                                if (visionText.textBlocks.isEmpty()) {
-                                    translatedBlocks = emptyMap()
-                                    stableOcrText = ""  // clear the previous stable translation
-                                    singleTranslatedText = "Point at text to translate"
-                                    return@addOnSuccessListener
-                                }
+                    // Convert ImageProxy → Bitmap → rotate
+                    val bitmap = imageProxy.toBitmap()?.rotate(rotationDegrees.toFloat())
+                    if (bitmap == null) {
+                        imageProxy.close()
+                        return@setAnalyzer
+                    }
 
-                                val allBlocksData = visionText.textBlocks.mapNotNull { block ->
-                                    block.boundingBox?.let {
-                                        val rect = RectF(it).apply {
-                                            inset(-8f, -8f) // expand box
-                                        }
-                                        TextBlockData(rect, block.text, imageWidth, imageHeight)
-                                    }
+                    latestBitmap = bitmap
 
-                                }
+                    val imageWidth = bitmap.width
+                    val imageHeight = bitmap.height
 
-                                val mergedBlocks = mutableListOf<TextBlockData>()
-                                allBlocksData.forEach { block ->
-                                    if (mergedBlocks.isEmpty()) mergedBlocks.add(block)
-                                    else {
-                                        val last = mergedBlocks.last()
-                                        if (Math.abs(last.box.top - block.box.top) < 20f) {
-                                            val mergedText = last.text + " " + block.text
-                                            val mergedRect = RectF(
-                                                minOf(last.box.left, block.box.left),
-                                                minOf(last.box.top, block.box.top),
-                                                maxOf(last.box.right, block.box.right),
-                                                maxOf(last.box.bottom, block.box.bottom)
-                                            )
-                                            mergedBlocks[mergedBlocks.lastIndex] = last.copy(text = mergedText, box = mergedRect)
-                                        } else mergedBlocks.add(block)
-                                    }
-                                }
-
-                                // Launch translation coroutine for both online & offline
-                                if (mergedBlocks.isNotEmpty()) {
-                                    val imageCenterX = imageWidth / 2f
-                                    val imageCenterY = imageHeight / 2f
-
-                                    val transformedBlocks: List<Pair<TextBlockData, RectF>> = mergedBlocks.map { block ->
-                                        block to transformRect(block.box, block.sourceImageWidth, block.sourceImageHeight)
-                                    }
-
-                                    val nearbyBlocks: List<TextBlockData> = transformedBlocks
-                                        .filter { pair ->
-                                            val rect = pair.second
-                                            selectionBox.contains(rect.centerX(), rect.centerY())
-                                        }
-                                        .map { pair -> pair.first } // get original block
+                    // NEW OCR INPUT: bitmap-based (more stable)
+                    //val normalizedBitmap = ImagePreprocess.normalizeForOcr(bitmap)
+                    val inputImage = InputImage.fromBitmap(bitmap, 0)
 
 
+                    recognizer.process(inputImage)
+                        .addOnSuccessListener { visionText ->
 
+                            if (visionText.textBlocks.isEmpty()) {
+                                translatedBlocks = emptyMap()
+                                stableOcrText = ""
+                                singleTranslatedText = "Point at text to translate"
+                                return@addOnSuccessListener
+                            }
 
-                                    if (nearbyBlocks.isEmpty()) return@addOnSuccessListener
-
-                                    // Join all merged block text into one single string to compare stability
-                                    val currentMergedText = nearbyBlocks.joinToString(" ") { it.text }
-                                    val normalized = normalizeText(currentMergedText)
-                                    val now = System.currentTimeMillis()
-
-                                    // First frame of text ever → accept immediately
-                                    if (lastOcrText.isEmpty()) {
-                                        lastOcrText = normalized
-                                        lastStableTime = now
-                                    }
-
-                                    // Compare stability
-                                    val sim = similarity(normalized, lastOcrText)
-
-                                    // If text changed too much, reset timer
-                                    if (sim < 0.50) {
-                                        lastOcrText = normalized
-                                        lastStableTime = now
-                                        return@addOnSuccessListener
-                                    }
-
-                                    // Require at least 200ms of stable text
-                                    if (now - lastStableTime < 100) {
-                                        return@addOnSuccessListener
-                                    }
-
-                                    // Only translate when OCR text is NEW and STABLE
-                                    if (normalized != stableOcrText) {
-                                        stableOcrText = normalized
-
-                                        scope.launch {
-                                            val results = nearbyBlocks.flatMap { data ->
-                                                val cleaned = data.text.trim().replace(Regex("[\\n]+"), " ")
-
-                                                //  Ignore insanely long OCR garbage
-                                                if (cleaned.length > 450) return@flatMap emptyList()
-
-                                                val parts = if (cleaned.length > 449) {
-                                                    chunkTextSmart(cleaned)
-                                                } else {
-                                                    listOf(cleaned)
-                                                }
-
-                                                parts.mapNotNull { part ->
-                                                    if (!isPotentiallyMeaningful(part)) return@mapNotNull null
-
-                                                    async {
-                                                        val cached = cachedStableMap[part]
-                                                        val translated = if (cached != null) cached else {
-                                                            val t = stableTranslate(part, germanToEnglishTranslator)
-                                                            cachedStableMap = cachedStableMap + (part to t)
-                                                            t
-                                                        }
-
-                                                        // reuse same box for now
-                                                        data.copy(text = part) to translated
-                                                    }
-                                                }
-                                            }.awaitAll()
-
-                                            withContext(Dispatchers.Main) {
-                                                translatedBlocks = results.toMap()
-                                            }
-                                        }
-                                    }
-
-                                    return@addOnSuccessListener
-                                }
-
-
-                                else {
-                                    val imageCenterX = imageWidth / 2f
-                                    val imageCenterY = imageHeight / 2f
-                                    val foundBlock = visionText.textBlocks.minByOrNull { block ->
-                                        val blockCenterY = block.boundingBox?.centerY()?.toFloat() ?: 0f
-                                        val blockCenterX = block.boundingBox?.centerX()?.toFloat() ?: 0f
-                                        (blockCenterX - imageCenterX).pow(2) + (blockCenterY - imageCenterY).pow(2)
-                                    }
-
-                                    if (foundBlock != null) {
-                                        val text = foundBlock.text
-                                        if (isPotentiallyMeaningful(text)) {
-                                            scope.launch {
-                                                val translated = if (currentMode == LensMode.ONLINE) {
-                                                    translateOnline(text) // call your online translator
-                                                } else {
-                                                    translateBasedOnMode(text, LensMode.OFFLINE, germanToEnglishTranslator)
-                                                }
-                                                val prev = translationCache[text]
-                                                if (prev != translated) {
-                                                    translationCache[text] = translated
-                                                    withContext(Dispatchers.Main) {
-                                                        singleTranslatedText = translated
-                                                    }
-                                                }
-
-                                            }
-
-                                        } else {
-                                            singleTranslatedText = "..."
-                                        }
-                                    } else {
-                                        singleTranslatedText = "Point at text to translate"
-                                    }
-
+                            // Extract OCR blocks
+                            val blocks = visionText.textBlocks.mapNotNull { block ->
+                                block.boundingBox?.let { box ->
+                                    val expanded = RectF(box).apply { inset(-8f, -8f) }
+                                    TextBlockData(expanded, block.text, imageWidth, imageHeight)
                                 }
                             }
-                            .addOnFailureListener { e -> Log.e("TextRecognition", "Recognition failed: $e") }
-                            .addOnCompleteListener { imageProxy.close() }
-                        lastAnalyzedTimestamp = currentTime
-                    } else {
-                        imageProxy.close()
-                    }
+
+                            //  Merge nearby horizontal blocks
+                            val mergedBlocks = mutableListOf<TextBlockData>()
+                            for (block in blocks) {
+                                val last = mergedBlocks.lastOrNull()
+                                if (last != null && kotlin.math.abs(last.box.top - block.box.top) < 20f) {
+                                    val mergedText = last.text + " " + block.text
+                                    val mergedRect = RectF(
+                                        minOf(last.box.left, block.box.left),
+                                        minOf(last.box.top, block.box.top),
+                                        maxOf(last.box.right, block.box.right),
+                                        maxOf(last.box.bottom, block.box.bottom)
+                                    )
+                                    mergedBlocks[mergedBlocks.lastIndex] =
+                                        last.copy(text = mergedText, box = mergedRect)
+                                } else {
+                                    mergedBlocks.add(block)
+                                }
+                            }
+
+                            //  Selection-based OCR
+                            val selectedBlocks = mergedBlocks.filter { block ->
+                                val transformed = transformRect(
+                                    block.box,
+                                    block.sourceImageWidth,
+                                    block.sourceImageHeight
+                                )
+                                selectionBox.contains(transformed.centerX(), transformed.centerY())
+                            }
+
+                            if (selectedBlocks.isEmpty()) return@addOnSuccessListener
+
+                            //  Stability check
+                            val currentText = selectedBlocks.joinToString(" ") { it.text }
+                            val normalized = normalizeText(currentText)
+                            val now = System.currentTimeMillis()
+
+                            if (lastOcrText.isEmpty()) {
+                                lastOcrText = normalized
+                                lastStableTime = now
+                                return@addOnSuccessListener
+                            }
+
+                            val sim = similarity(normalized, lastOcrText)
+                            if (sim < 0.5) {
+                                lastOcrText = normalized
+                                lastStableTime = now
+                                return@addOnSuccessListener
+                            }
+
+                            if (now - lastStableTime < 100) return@addOnSuccessListener
+
+                            if (normalized == stableOcrText) return@addOnSuccessListener
+                            stableOcrText = normalized
+
+                            // ---- Translation ----
+                            scope.launch {
+                                val results = mutableListOf<Pair<TextBlockData, String>>()
+
+                                for (block in selectedBlocks) {
+                                    val cleaned = block.text.replace("\n", " ").trim()
+                                    if (!isPotentiallyMeaningful(cleaned)) continue
+
+                                    val translated = stableTranslate(cleaned, germanToEnglishTranslator)
+                                    results.add(block.copy(text = cleaned) to translated)
+                                }
+
+
+                                withContext(Dispatchers.Main) {
+                                    translatedBlocks = results.toMap()
+                                }
+                            }
+                        }
+                        .addOnFailureListener {
+                            Log.e("OCR", "Recognition failed", it)
+                        }
+                        .addOnCompleteListener {
+                            imageProxy.close()
+                        }
+
+                    lastAnalyzedTimestamp = currentTime
                 }
+
 
                 try {
                     cameraProvider.unbindAll()
