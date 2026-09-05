@@ -16,7 +16,6 @@ android {
         versionName = "1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
-
     }
 
     buildTypes {
@@ -27,60 +26,65 @@ android {
                 "proguard-rules.pro"
             )
         }
+        debug {
+            // OpenCV and ML Kit each ship a native library per ABI, and the two
+            // emulator-only ones accounted for well over half the debug APK.
+            // Release keeps every ABI, so device support is unchanged.
+            ndk {
+                abiFilters += listOf("arm64-v8a", "x86_64")
+            }
+        }
     }
+
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17
-    }
-    kotlinOptions {
-        jvmTarget = "17"
     }
 
     kotlin {
         jvmToolchain(17)
     }
+
     buildFeatures {
         compose = true
     }
 }
 
 dependencies {
-    implementation("androidx.core:core-ktx:1.12.0")
-    implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.6.2")
-    implementation("androidx.activity:activity-compose:1.8.2")
-    implementation("androidx.compose.ui:ui:1.5.0")
-    implementation("androidx.compose.ui:ui-graphics:1.5.0")
-    implementation("androidx.compose.ui:ui-tooling-preview:1.5.0")
-    implementation("androidx.compose.material3:material3:1.2.0")
-    implementation(libs.androidx.material3)
-    testImplementation("junit:junit:4.13.2")
-    androidTestImplementation("androidx.test.ext:junit:1.1.5")
-    androidTestImplementation("androidx.test.espresso:espresso-core:3.5.1")
-    debugImplementation("androidx.compose.ui:ui-tooling:1.5.0")
-    debugImplementation("androidx.compose.ui:ui-test-manifest:1.5.0")
+    // One BOM decides every Compose artifact version, rather than each one being
+    // pinned by hand to versions that did not agree with each other.
+    val composeBom = platform(libs.androidx.compose.bom)
+    implementation(composeBom)
+    androidTestImplementation(composeBom)
 
-    // ONNX Runtime Mobile
-    implementation("com.microsoft.onnxruntime:onnxruntime-mobile:1.17.0")
+    implementation(libs.androidx.core.ktx)
+    implementation(libs.androidx.lifecycle.runtime.ktx)
+    implementation(libs.androidx.lifecycle.runtime.compose)
+    implementation(libs.androidx.lifecycle.viewmodel.compose)
+    implementation(libs.androidx.activity.compose)
 
-    // CameraX
-    implementation("androidx.camera:camera-core:1.5.1")
-    implementation("androidx.camera:camera-camera2:1.5.1")
-    implementation("androidx.camera:camera-lifecycle:1.5.1")
-    implementation("androidx.camera:camera-view:1.5.1")
+    implementation(libs.androidx.compose.ui)
+    implementation(libs.androidx.compose.ui.graphics)
+    implementation(libs.androidx.compose.ui.tooling.preview)
+    implementation(libs.androidx.compose.material3)
+    debugImplementation(libs.androidx.compose.ui.tooling)
+    debugImplementation(libs.androidx.compose.ui.test.manifest)
 
-    // ML Kit Text Recognition
-    implementation("com.google.mlkit:text-recognition:16.0.0")
+    implementation(libs.androidx.camera.core)
+    implementation(libs.androidx.camera.camera2)
+    implementation(libs.androidx.camera.lifecycle)
+    implementation(libs.androidx.camera.view)
 
-    // ML Kit Translation
-    implementation("com.google.mlkit:translate:17.0.2")
+    implementation(libs.mlkit.text.recognition)
+    implementation(libs.mlkit.translate)
 
-    implementation("com.squareup.okhttp3:okhttp:4.12.0")
-
-    implementation("org.json:json:20230227")
+    // Only used by the online translation path, which is not wired up yet.
+    // org.json is not listed: Android already provides it in the framework.
+    implementation(libs.okhttp)
 
     implementation(project(":opencv"))
 
-
-
-
+    testImplementation(libs.junit)
+    androidTestImplementation(libs.androidx.junit)
+    androidTestImplementation(libs.androidx.espresso.core)
 }

@@ -1,4 +1,4 @@
-package com.example.realtimetranslator
+package com.example.realtimetranslator.ocr
 
 
 import android.graphics.Bitmap

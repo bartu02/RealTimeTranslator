@@ -13,3 +13,9 @@
 .externalNativeBuild
 .cxx
 local.properties
+
+# OpenCV Android SDK: supplied locally, see README
+/opencv
+
+# Kotlin compiler scratch
+.kotlin
